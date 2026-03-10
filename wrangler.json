@@ -1,0 +1,23 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "kfund",
+  "main": "src/worker.ts",
+  "compatibility_date": "2025-04-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "assets": {
+    "binding": "ASSETS",
+    "directory": "./dist",
+    "not_found_handling": "none"
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "inventory_db",
+      "database_id": "12f5c187-eecf-4a2e-b08b-02e9172ed813"
+    }
+  ],
+  "kv_namespaces": [
+    { "binding": "SESSIONS", "id": "caa9d82e93f44175bdf303f06f211baf" },
+    { "binding": "RATE_LIMIT", "id": "d5d2303c331b45258c0cffc5e1ae2c0d" }
+  ]
+}

@@ -1,0 +1,26 @@
+{
+  "name": "kfund",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "deploy": "wrangler deploy",
+    "lint": "eslint ."
+  },
+  "dependencies": {
+    "@cloudflare/workers-types": "^4.20260310.1",
+    "hono": "^4.7.7",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
+  },
+  "devDependencies": {
+    "@cloudflare/vite-plugin": "^1.0.8",
+    "@types/react": "^19.0.10",
+    "@types/react-dom": "^19.0.4",
+    "@vitejs/plugin-react": "^4.4.1",
+    "typescript": "^5.8.3",
+    "vite": "^6.3.2",
+    "wrangler": "^4.12.0"
+  }
+}
