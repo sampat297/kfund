@@ -1,4 +1,5 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
+import QRCode from "qrcode";
 import { S, SessionInfo } from "../App";
 
 export default function SettingsPage({
@@ -173,6 +174,13 @@ function TOTPSection({ totpEnabled, onChanged }: { totpEnabled: boolean; onChang
   const [err, setErr] = useState("");
   const [ok, setOk] = useState("");
   const [loading, setLoading] = useState(false);
+  const qrRef = useRef<HTMLCanvasElement>(null);
+
+  useEffect(() => {
+    if (setup?.otpauth_uri && qrRef.current) {
+      QRCode.toCanvas(qrRef.current, setup.otpauth_uri, { width: 200, margin: 2, color: { dark: "#000", light: "#fff" } });
+    }
+  }, [setup]);
 
   const startSetup = async () => {
     setErr(""); setOk("");
@@ -228,13 +236,13 @@ function TOTPSection({ totpEnabled, onChanged }: { totpEnabled: boolean; onChang
       ) : setup ? (
         <div>
           <p style={{ color: "#8b949e", fontSize: "0.875rem", marginBottom: "0.75rem" }}>
-            Scan this URI with your authenticator app (Google Authenticator, Authy, etc.):
+            Scan with Google Authenticator, Authy, or any TOTP app:
           </p>
-          <div style={{ background: "#0d1117", border: "1px solid #30363d", borderRadius: 6, padding: "0.75rem", marginBottom: "1rem", wordBreak: "break-all" }}>
-            <code style={{ color: "#58a6ff", fontSize: "0.75rem" }}>{setup.otpauth_uri}</code>
+          <div style={{ background: "#fff", display: "inline-block", padding: 8, borderRadius: 8, marginBottom: "1rem" }}>
+            <canvas ref={qrRef} />
           </div>
           <p style={{ color: "#8b949e", fontSize: "0.875rem", marginBottom: "0.75rem" }}>
-            Or enter this secret manually: <code style={{ color: "#d29922" }}>{setup.secret}</code>
+            Or enter manually: <code style={{ color: "#d29922" }}>{setup.secret}</code>
           </p>
           <form onSubmit={verify} style={{ display: "flex", gap: "0.5rem", alignItems: "flex-end" }}>
             <div style={{ flex: 1 }}>

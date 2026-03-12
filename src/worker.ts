@@ -351,8 +351,8 @@ app.get("/api/feed", async (c) => {
   const db = c.env.DB;
 
   const [rows, countRow] = await Promise.all([
-    db.prepare("SELECT * FROM kf_trade_events ORDER BY created_at DESC LIMIT 20 OFFSET ?").bind(offset).all(),
-    db.prepare("SELECT COUNT(*) as cnt FROM kf_trade_events").first() as Promise<any>,
+    db.prepare("SELECT * FROM kf_trade_events WHERE event_type NOT IN ('no_signal','signal','balance_refresh') ORDER BY created_at DESC LIMIT 20 OFFSET ?").bind(offset).all(),
+    db.prepare("SELECT COUNT(*) as cnt FROM kf_trade_events WHERE event_type NOT IN ('no_signal','signal','balance_refresh')").first() as Promise<any>,
   ]);
 
   const events = (rows.results as any[]).map((r: any) => ({
