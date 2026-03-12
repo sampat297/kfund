@@ -5,6 +5,7 @@ import LeaderboardPage from "./pages/LeaderboardPage";
 import FeedPage from "./pages/FeedPage";
 import SettingsPage from "./pages/SettingsPage";
 import AdminPage from "./pages/AdminPage";
+import VizPage from "./pages/VizPage";
 
 // ─── Shared styles ────────────────────────────────────────────────────────────
 
@@ -126,6 +127,7 @@ function NavBar({ session, onLogout }: { session: SessionInfo; onLogout: () => v
       {navLink("Portfolio", "#/dashboard")}
       {navLink("Leaderboard", "#/leaderboard")}
       {navLink("Feed", "#/feed")}
+      {navLink("Bot Viz", "#/viz", { color: hash === "#/viz" ? "#3fb950" : "#2ea043" })}
       {navLink("Settings", "#/settings")}
       {session?.is_admin ? navLink("Admin", "#/admin", { color: hash === "#/admin" ? "#ffd700" : "#d29922" }) : null}
       <span style={{ flex: 1 }} />
@@ -184,6 +186,7 @@ export default function App() {
     if (page === "/" || page === "/dashboard") return <DashboardPage session={session} />;
     if (page === "/leaderboard") return <LeaderboardPage />;
     if (page === "/feed") return <FeedPage />;
+    if (page === "/viz") return <VizPage session={session} />;
     if (page === "/settings") return <SettingsPage session={session} onSessionUpdate={(s) => setSession(s)} />;
     if (page === "/admin") return session.is_admin ? <AdminPage /> : <div style={{ padding: "2rem", color: "#f85149" }}>Access denied</div>;
     return <DashboardPage session={session} />;

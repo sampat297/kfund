@@ -17,6 +17,15 @@ type SessionData = {
   display_name: string;
 };
 
+type TradeEvent = {
+  id: number;
+  event_type: string;
+  title: string;
+  payload: string;
+  fund_balance: number | null;
+  created_at: string;
+};
+
 // ─── Crypto helpers ──────────────────────────────────────────────────────────
 
 async function hashPassword(password: string, salt: string): Promise<string> {
@@ -691,6 +700,71 @@ app.post("/api/events/push", async (c) => {
     .run();
 
   return c.json({ ok: true });
+});
+
+// ─── Viz API ─────────────────────────────────────────────────────────────────
+
+app.get("/api/viz/state", async (c) => {
+  const session = await getSession(c);
+  if (!session) return c.json({ error: "Unauthorized" }, 401);
+  const db = c.env.DB;
+
+  const [fundRow, eventsRow, countsRow, fillsRow] = await Promise.all([
+    db.prepare("SELECT balance, total_units FROM kf_fund_state WHERE id = 1").first<any>(),
+    db.prepare("SELECT id, event_type, title, payload, fund_balance, created_at FROM kf_trade_events ORDER BY id DESC LIMIT 30").all<TradeEvent>(),
+    db.prepare("SELECT event_type, COUNT(*) as cnt FROM kf_trade_events GROUP BY event_type").all<{ event_type: string; cnt: number }>(),
+    db.prepare("SELECT COUNT(*) as cnt FROM kf_trade_events WHERE event_type = 'order_fill'").first<{ cnt: number }>(),
+  ]);
+
+  // Build equity curve from all events that have fund_balance (chronological)
+  const equityRows = await db
+    .prepare("SELECT fund_balance, created_at FROM kf_trade_events WHERE fund_balance IS NOT NULL ORDER BY id ASC LIMIT 200")
+    .all<{ fund_balance: number; created_at: string }>();
+
+  const equity_curve = (equityRows.results ?? []).map((r) => ({ ts: r.created_at, balance: r.fund_balance }));
+
+  // Total PnL: last known balance - initial deposit baseline ($338)
+  const balance = fundRow?.balance ?? 0;
+  const total_units = fundRow?.total_units ?? 0;
+  const nav = total_units > 0 ? balance / total_units : 1.0;
+
+  // PnL from fills: sum payload.net_pnl_usd
+  let total_pnl = 0;
+  for (const ev of eventsRow.results ?? []) {
+    if (ev.event_type === "order_fill" || ev.event_type === "settlement") {
+      try {
+        const p = typeof ev.payload === "string" ? JSON.parse(ev.payload) : ev.payload;
+        if (typeof p?.net_pnl_usd === "number") total_pnl += p.net_pnl_usd;
+      } catch { /* ignore */ }
+    }
+  }
+
+  const event_type_counts: Record<string, number> = {};
+  for (const r of countsRow.results ?? []) {
+    event_type_counts[r.event_type] = r.cnt;
+  }
+
+  return c.json({
+    balance,
+    total_units,
+    nav,
+    total_pnl,
+    session_fills: fillsRow?.cnt ?? 0,
+    equity_curve,
+    recent_events: (eventsRow.results ?? []).slice(0, 20),
+    event_type_counts,
+  });
+});
+
+app.get("/api/viz/events", async (c) => {
+  const session = await getSession(c);
+  if (!session) return c.json({ error: "Unauthorized" }, 401);
+  const limit = Math.min(parseInt(c.req.query("limit") ?? "50"), 100);
+  const rows = await c.env.DB
+    .prepare("SELECT id, event_type, title, payload, fund_balance, created_at FROM kf_trade_events ORDER BY id DESC LIMIT ?")
+    .bind(limit)
+    .all<TradeEvent>();
+  return c.json(rows.results ?? []);
 });
 
 // ─── Static assets fallback ───────────────────────────────────────────────────
