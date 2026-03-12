@@ -238,7 +238,8 @@ app.use("/api/*", async (c, next) => {
   if (
     path === "/api/auth/login" ||
     path === "/api/auth/logout" ||
-    path === "/api/auth/me"
+    path === "/api/auth/me" ||
+    path === "/api/events/push"
   ) return next();
   const session = await getSession(c);
   if (!session) return c.json({ error: "Unauthorized" }, 401);
@@ -691,13 +692,27 @@ app.post("/api/events/push", async (c) => {
     return c.json({ error: "event_type, title, payload required" }, 400);
 
   const payloadStr = typeof payload === "string" ? payload : JSON.stringify(payload);
+  const db = c.env.DB;
 
-  await c.env.DB
-    .prepare(
-      "INSERT INTO kf_trade_events (event_type, title, payload, fund_balance, created_at) VALUES (?, ?, ?, ?, datetime('now'))"
-    )
+  // Prune old signal/no_signal rows to keep table lean (keep only latest 500 each)
+  if (event_type === "signal" || event_type === "no_signal" || event_type === "balance_refresh") {
+    await db.prepare(
+      `DELETE FROM kf_trade_events WHERE event_type = ? AND id NOT IN (SELECT id FROM kf_trade_events WHERE event_type = ? ORDER BY id DESC LIMIT 500)`
+    ).bind(event_type, event_type).run().catch(() => {});
+  }
+
+  await db
+    .prepare("INSERT INTO kf_trade_events (event_type, title, payload, fund_balance, created_at) VALUES (?, ?, ?, ?, datetime('now'))")
     .bind(event_type, title, payloadStr, fund_balance ?? null)
     .run();
+
+  // Sync live balance into kf_fund_state on balance_refresh
+  if (event_type === "balance_refresh" && typeof fund_balance === "number" && fund_balance > 0) {
+    await db
+      .prepare("UPDATE kf_fund_state SET balance = ?, updated_at = datetime('now') WHERE id = 1")
+      .bind(fund_balance)
+      .run();
+  }
 
   return c.json({ ok: true });
 });
@@ -709,50 +724,106 @@ app.get("/api/viz/state", async (c) => {
   if (!session) return c.json({ error: "Unauthorized" }, 401);
   const db = c.env.DB;
 
-  const [fundRow, eventsRow, countsRow, fillsRow] = await Promise.all([
-    db.prepare("SELECT balance, total_units FROM kf_fund_state WHERE id = 1").first<any>(),
-    db.prepare("SELECT id, event_type, title, payload, fund_balance, created_at FROM kf_trade_events ORDER BY id DESC LIMIT 30").all<TradeEvent>(),
+  const [fundRow, fillsAll, recentEvents, countRows] = await Promise.all([
+    db.prepare("SELECT balance, total_units, updated_at FROM kf_fund_state WHERE id = 1").first<any>(),
+    db.prepare("SELECT payload, fund_balance, created_at FROM kf_trade_events WHERE event_type IN ('order_fill','settlement') ORDER BY id ASC").all<TradeEvent>(),
+    db.prepare("SELECT id, event_type, title, payload, fund_balance, created_at FROM kf_trade_events WHERE event_type NOT IN ('no_signal','signal','balance_refresh') ORDER BY id DESC LIMIT 25").all<TradeEvent>(),
     db.prepare("SELECT event_type, COUNT(*) as cnt FROM kf_trade_events GROUP BY event_type").all<{ event_type: string; cnt: number }>(),
-    db.prepare("SELECT COUNT(*) as cnt FROM kf_trade_events WHERE event_type = 'order_fill'").first<{ cnt: number }>(),
   ]);
 
-  // Build equity curve from all events that have fund_balance (chronological)
-  const equityRows = await db
-    .prepare("SELECT fund_balance, created_at FROM kf_trade_events WHERE fund_balance IS NOT NULL ORDER BY id ASC LIMIT 200")
-    .all<{ fund_balance: number; created_at: string }>();
-
-  const equity_curve = (equityRows.results ?? []).map((r) => ({ ts: r.created_at, balance: r.fund_balance }));
-
-  // Total PnL: last known balance - initial deposit baseline ($338)
+  // ── Balance & NAV ──
   const balance = fundRow?.balance ?? 0;
   const total_units = fundRow?.total_units ?? 0;
   const nav = total_units > 0 ? balance / total_units : 1.0;
+  const balance_updated_at = fundRow?.updated_at ?? null;
 
-  // PnL from fills: sum payload.net_pnl_usd
-  let total_pnl = 0;
-  for (const ev of eventsRow.results ?? []) {
-    if (ev.event_type === "order_fill" || ev.event_type === "settlement") {
-      try {
-        const p = typeof ev.payload === "string" ? JSON.parse(ev.payload) : ev.payload;
-        if (typeof p?.net_pnl_usd === "number") total_pnl += p.net_pnl_usd;
-      } catch { /* ignore */ }
-    }
+  // ── Fills analysis ──
+  let wins = 0, losses = 0, total_pnl = 0;
+  const equity_curve: { ts: string; balance: number; pnl: number }[] = [];
+  let running_pnl = 0;
+  for (const ev of fillsAll.results ?? []) {
+    try {
+      const p = typeof ev.payload === "string" ? JSON.parse(ev.payload) : ev.payload as any;
+      const pnl = typeof p?.net_pnl_usd === "number" ? p.net_pnl_usd : 0;
+      total_pnl += pnl;
+      running_pnl += pnl;
+      if (pnl > 0) wins++; else if (pnl < 0) losses++;
+      // Use actual balance from fund_balance if present, else use running pnl relative to starting bal
+      const bal_point = typeof ev.fund_balance === "number" && ev.fund_balance > 0
+        ? ev.fund_balance : (balance - total_pnl + running_pnl);
+      equity_curve.push({ ts: ev.created_at, balance: parseFloat(bal_point.toFixed(2)), pnl: parseFloat(pnl.toFixed(2)) });
+    } catch { /* skip */ }
+  }
+
+  // ── Last signal for GRU probs ──
+  const lastSignal = await db
+    .prepare("SELECT payload FROM kf_trade_events WHERE event_type = 'signal' ORDER BY id DESC LIMIT 1")
+    .first<{ payload: string }>();
+  let gru: Record<string, number> = {};
+  let last_model_prob: number | null = null;
+  let last_signal_ts: string | null = null;
+  let last_signal_side: string | null = null;
+  if (lastSignal) {
+    try {
+      const p = JSON.parse(lastSignal.payload) as any;
+      last_model_prob = p.model_prob ?? null;
+      last_signal_side = p.side ?? null;
+      last_signal_ts = p.timestamp ?? null;
+      if (p.gru_p_down_30s !== undefined) {
+        gru = {
+          l1_down: p.gru_p_down_30s, l1_flat: p.gru_p_flat_30s, l1_up: p.gru_p_up_30s,
+          l2_down: p.gru_p_down_60s, l2_flat: p.gru_p_flat_60s, l2_up: p.gru_p_up_60s,
+          l3_down: p.gru_p_down_300s, l3_flat: p.gru_p_flat_300s, l3_up: p.gru_p_up_300s,
+        };
+      }
+    } catch { /* ignore */ }
+  }
+
+  // ── Recent model probs (last 50 signals) ──
+  const probRows = await db
+    .prepare("SELECT fund_balance, created_at FROM kf_trade_events WHERE event_type = 'signal' ORDER BY id DESC LIMIT 50")
+    .all<{ fund_balance: number; created_at: string }>();
+  const recent_probs = (probRows.results ?? []).reverse().map(r => ({
+    prob: r.fund_balance, ts: r.created_at
+  }));
+
+  // ── Skip reasons (last 200 no_signal) ──
+  const skipRows = await db
+    .prepare("SELECT payload FROM kf_trade_events WHERE event_type = 'no_signal' ORDER BY id DESC LIMIT 200")
+    .all<{ payload: string }>();
+  const skip_reasons: Record<string, number> = {};
+  for (const row of skipRows.results ?? []) {
+    try {
+      const p = JSON.parse(row.payload) as any;
+      const reason = p.skip_reason ?? "unknown";
+      skip_reasons[reason] = (skip_reasons[reason] ?? 0) + 1;
+    } catch { /* skip */ }
   }
 
   const event_type_counts: Record<string, number> = {};
-  for (const r of countsRow.results ?? []) {
+  for (const r of countRows.results ?? []) {
     event_type_counts[r.event_type] = r.cnt;
   }
 
   return c.json({
     balance,
+    balance_updated_at,
     total_units,
     nav,
-    total_pnl,
-    session_fills: fillsRow?.cnt ?? 0,
+    total_pnl: parseFloat(total_pnl.toFixed(2)),
+    wins,
+    losses,
+    win_rate: wins + losses > 0 ? parseFloat(((wins / (wins + losses)) * 100).toFixed(1)) : null,
+    total_fills: wins + losses,
     equity_curve,
-    recent_events: (eventsRow.results ?? []).slice(0, 20),
+    recent_events: recentEvents.results ?? [],
     event_type_counts,
+    gru,
+    last_model_prob,
+    last_signal_ts,
+    last_signal_side,
+    recent_probs,
+    skip_reasons,
   });
 });
 
@@ -761,7 +832,7 @@ app.get("/api/viz/events", async (c) => {
   if (!session) return c.json({ error: "Unauthorized" }, 401);
   const limit = Math.min(parseInt(c.req.query("limit") ?? "50"), 100);
   const rows = await c.env.DB
-    .prepare("SELECT id, event_type, title, payload, fund_balance, created_at FROM kf_trade_events ORDER BY id DESC LIMIT ?")
+    .prepare("SELECT id, event_type, title, payload, fund_balance, created_at FROM kf_trade_events WHERE event_type NOT IN ('no_signal','signal','balance_refresh') ORDER BY id DESC LIMIT ?")
     .bind(limit)
     .all<TradeEvent>();
   return c.json(rows.results ?? []);
