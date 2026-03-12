@@ -739,19 +739,39 @@ app.get("/api/viz/state", async (c) => {
 
   // ── Fills analysis ──
   let wins = 0, losses = 0, total_pnl = 0;
+  let win_pnl = 0, loss_pnl = 0;
+  let best_trade = 0, worst_trade = 0;
+  let yes_wins = 0, yes_losses = 0, no_wins = 0, no_losses = 0;
+  let yes_pnl = 0, no_pnl = 0;
+  let total_contracts = 0;
   const equity_curve: { ts: string; balance: number; pnl: number }[] = [];
+  const pnl_bars: { pnl: number; side: string; ts: string; ticker: string }[] = [];
   let running_pnl = 0;
+  const today_utc = new Date().toISOString().slice(0, 10);
+  let today_pnl = 0, today_wins = 0, today_losses = 0;
+
   for (const ev of fillsAll.results ?? []) {
     try {
       const p = typeof ev.payload === "string" ? JSON.parse(ev.payload) : ev.payload as any;
       const pnl = typeof p?.net_pnl_usd === "number" ? p.net_pnl_usd : 0;
+      const side = (p?.side ?? "unknown") as string;
+      const ticker = (p?.ticker ?? "") as string;
+      const contracts = typeof p?.contracts === "number" ? p.contracts : 0;
       total_pnl += pnl;
       running_pnl += pnl;
-      if (pnl > 0) wins++; else if (pnl < 0) losses++;
-      // Use actual balance from fund_balance if present, else use running pnl relative to starting bal
+      total_contracts += contracts;
+      if (pnl > 0) { wins++; win_pnl += pnl; if (pnl > best_trade) best_trade = pnl; }
+      else if (pnl < 0) { losses++; loss_pnl += pnl; if (pnl < worst_trade) worst_trade = pnl; }
+      if (side === "yes") { yes_pnl += pnl; if (pnl > 0) yes_wins++; else if (pnl < 0) yes_losses++; }
+      else if (side === "no") { no_pnl += pnl; if (pnl > 0) no_wins++; else if (pnl < 0) no_losses++; }
+      if (ev.created_at?.slice(0, 10) === today_utc) {
+        today_pnl += pnl;
+        if (pnl > 0) today_wins++; else if (pnl < 0) today_losses++;
+      }
       const bal_point = typeof ev.fund_balance === "number" && ev.fund_balance > 0
         ? ev.fund_balance : (balance - total_pnl + running_pnl);
       equity_curve.push({ ts: ev.created_at, balance: parseFloat(bal_point.toFixed(2)), pnl: parseFloat(pnl.toFixed(2)) });
+      pnl_bars.push({ pnl: parseFloat(pnl.toFixed(2)), side, ts: ev.created_at, ticker });
     } catch { /* skip */ }
   }
 
@@ -815,7 +835,17 @@ app.get("/api/viz/state", async (c) => {
     losses,
     win_rate: wins + losses > 0 ? parseFloat(((wins / (wins + losses)) * 100).toFixed(1)) : null,
     total_fills: wins + losses,
+    avg_win: wins > 0 ? parseFloat((win_pnl / wins).toFixed(2)) : null,
+    avg_loss: losses > 0 ? parseFloat((loss_pnl / losses).toFixed(2)) : null,
+    best_trade: parseFloat(best_trade.toFixed(2)),
+    worst_trade: parseFloat(worst_trade.toFixed(2)),
+    total_contracts,
+    by_side: { yes_wins, yes_losses, no_wins, no_losses, yes_pnl: parseFloat(yes_pnl.toFixed(2)), no_pnl: parseFloat(no_pnl.toFixed(2)) },
+    today_pnl: parseFloat(today_pnl.toFixed(2)),
+    today_wins,
+    today_losses,
     equity_curve,
+    pnl_bars,
     recent_events: recentEvents.results ?? [],
     event_type_counts,
     gru,

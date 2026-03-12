@@ -28,7 +28,17 @@ type VizState = {
   losses: number;
   win_rate: number | null;
   total_fills: number;
+  avg_win: number | null;
+  avg_loss: number | null;
+  best_trade: number;
+  worst_trade: number;
+  total_contracts: number;
+  by_side: { yes_wins: number; yes_losses: number; no_wins: number; no_losses: number; yes_pnl: number; no_pnl: number };
+  today_pnl: number;
+  today_wins: number;
+  today_losses: number;
   equity_curve: { ts: string; balance: number; pnl: number }[];
+  pnl_bars: { pnl: number; side: string; ts: string; ticker: string }[];
   recent_events: TradeEvent[];
   event_type_counts: Record<string, number>;
   gru: GRU;
@@ -65,9 +75,7 @@ function EquityChart({ points }: { points: { ts: string; balance: number; pnl: n
     const toX = (i: number) => pad.left + ((i / (points.length - 1)) * (W - pad.left - pad.right));
     const toY = (v: number) => pad.top + ((1 - (v - min) / range) * (H - pad.top - pad.bottom));
 
-    // Grid
-    ctx.strokeStyle = "#21262d";
-    ctx.lineWidth = 1;
+    ctx.strokeStyle = "#21262d"; ctx.lineWidth = 1;
     [0, 0.25, 0.5, 0.75, 1].forEach((f) => {
       const v = min + (1 - f) * range;
       const y = pad.top + f * (H - pad.top - pad.bottom);
@@ -76,12 +84,9 @@ function EquityChart({ points }: { points: { ts: string; balance: number; pnl: n
       ctx.fillText("$" + v.toFixed(0), pad.left - 4, y + 4);
     });
 
-    // Gradient fill
     const isUp = vals[vals.length - 1] >= vals[0];
-    const upColor = isUp ? "rgba(35,134,54,0.3)" : "rgba(218,54,51,0.3)";
-    const lineColor = isUp ? "#3fb950" : "#f85149";
     const grad = ctx.createLinearGradient(0, pad.top, 0, H - pad.bottom);
-    grad.addColorStop(0, upColor);
+    grad.addColorStop(0, isUp ? "rgba(63,185,80,0.3)" : "rgba(218,54,51,0.3)");
     grad.addColorStop(1, "rgba(0,0,0,0)");
 
     ctx.beginPath();
@@ -89,116 +94,121 @@ function EquityChart({ points }: { points: { ts: string; balance: number; pnl: n
     points.forEach((_, i) => { if (i > 0) ctx.lineTo(toX(i), toY(vals[i])); });
     ctx.lineTo(toX(points.length - 1), H - pad.bottom);
     ctx.lineTo(toX(0), H - pad.bottom);
-    ctx.closePath();
-    ctx.fillStyle = grad;
-    ctx.fill();
+    ctx.closePath(); ctx.fillStyle = grad; ctx.fill();
 
-    // Win/loss dots on each trade
-    points.forEach((p, i) => {
-      if (p.pnl !== 0) {
-        const cx = toX(i), cy = toY(p.balance);
-        ctx.beginPath();
-        ctx.arc(cx, cy, 3, 0, Math.PI * 2);
-        ctx.fillStyle = p.pnl > 0 ? "#3fb950" : "#f85149";
-        ctx.fill();
-      }
-    });
-
-    // Line
-    ctx.beginPath();
-    ctx.strokeStyle = lineColor;
-    ctx.lineWidth = 2;
-    ctx.lineJoin = "round";
-    ctx.moveTo(toX(0), toY(vals[0]));
-    points.forEach((_, i) => { if (i > 0) ctx.lineTo(toX(i), toY(vals[i])); });
+    ctx.beginPath(); ctx.strokeStyle = isUp ? "#3fb950" : "#f85149"; ctx.lineWidth = 2;
+    points.forEach((p, i) => { if (i === 0) ctx.moveTo(toX(i), toY(p.balance)); else ctx.lineTo(toX(i), toY(p.balance)); });
     ctx.stroke();
 
-    // Latest label
-    const lx = toX(points.length - 1);
-    const ly = toY(vals[vals.length - 1]);
-    ctx.beginPath(); ctx.arc(lx, ly, 4, 0, Math.PI * 2);
-    ctx.fillStyle = lineColor; ctx.fill();
+    points.forEach((p, i) => {
+      const color = p.pnl > 0 ? "#3fb950" : p.pnl < 0 ? "#f85149" : "#484f58";
+      ctx.beginPath(); ctx.arc(toX(i), toY(p.balance), 3, 0, Math.PI * 2);
+      ctx.fillStyle = color; ctx.fill();
+    });
   }, [points]);
 
-  if (points.length < 2) {
-    return (
-      <div style={{ height: 180, display: "flex", alignItems: "center", justifyContent: "center", color: "#484f58", fontSize: "0.85rem", flexDirection: "column", gap: 8 }}>
-        <span style={{ fontSize: "1.5rem" }}>📈</span>
-        Equity curve builds as the bot trades…
-      </div>
-    );
-  }
+  if (points.length < 2)
+    return <div style={{ color: "#484f58", fontSize: "0.8rem", textAlign: "center", padding: "2rem" }}>No trade history yet — waiting for first fill</div>;
 
-  return <canvas ref={canvasRef} style={{ width: "100%", height: 180, display: "block" }} />;
+  return <canvas ref={canvasRef} style={{ width: "100%", height: "140px", display: "block" }} />;
 }
 
-// ─── Signal probability sparkline ─────────────────────────────────────────────
+// ─── P&L Bars chart ───────────────────────────────────────────────────────────
+
+function PnLBars({ bars }: { bars: { pnl: number; side: string; ts: string; ticker: string }[] }) {
+  if (bars.length === 0)
+    return <div style={{ color: "#484f58", fontSize: "0.8rem", textAlign: "center", padding: "1.5rem" }}>No fills yet</div>;
+
+  const max = Math.max(...bars.map((b) => Math.abs(b.pnl)), 0.01);
+
+  return (
+    <div style={{ display: "flex", alignItems: "flex-end", gap: 3, height: 90, paddingTop: 8 }}>
+      {bars.map((b, i) => {
+        const h = Math.max(4, (Math.abs(b.pnl) / max) * 80);
+        const color = b.pnl > 0 ? "#3fb950" : "#da3633";
+        const label = b.ticker?.split("_")[2]?.slice(-4) ?? `#${i + 1}`;
+        return (
+          <div key={i} style={{ flex: 1, display: "flex", flexDirection: "column", alignItems: "center" }}
+            title={`${b.ticker}\n${b.side.toUpperCase()} · ${b.pnl > 0 ? "+" : ""}$${b.pnl.toFixed(2)}\n${b.ts?.slice(0, 16)}`}>
+            <div style={{ width: "100%", height: h, background: color, borderRadius: "2px 2px 0 0", opacity: 0.9, transition: "height 0.4s" }} />
+            <div style={{ fontSize: "0.55rem", color: "#484f58", marginTop: 2, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: "100%", textAlign: "center" }}>
+              {label}
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+// ─── Signal probability sparkline ────────────────────────────────────────────
 
 function ProbSparkline({ probs }: { probs: { prob: number; ts: string }[] }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
 
   useEffect(() => {
     const canvas = canvasRef.current;
-    if (!canvas || probs.length < 2) return;
+    if (!canvas || probs.length === 0) return;
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
     const W = canvas.offsetWidth, H = canvas.offsetHeight;
-    canvas.width = W * window.devicePixelRatio;
-    canvas.height = H * window.devicePixelRatio;
+    canvas.width = W * window.devicePixelRatio; canvas.height = H * window.devicePixelRatio;
     ctx.scale(window.devicePixelRatio, window.devicePixelRatio);
-    const vals = probs.map((p) => p.prob ?? 0);
-    const toX = (i: number) => (i / (vals.length - 1)) * W;
-    const toY = (v: number) => H - (v * H * 0.85 + H * 0.05);
 
-    // Threshold line at 0.80
-    ctx.strokeStyle = "#484f58"; ctx.lineWidth = 1; ctx.setLineDash([4, 4]);
-    const ty = toY(0.80);
-    ctx.beginPath(); ctx.moveTo(0, ty); ctx.lineTo(W, ty); ctx.stroke();
-    ctx.setLineDash([]);
-    ctx.fillStyle = "#484f58"; ctx.font = "9px sans-serif"; ctx.textAlign = "left";
-    ctx.fillText("0.80", 2, ty - 2);
+    const min = 0.5, max = 1.0, range = max - min;
+    const pad = { top: 8, right: 8, bottom: 8, left: 8 };
+    const toX = (i: number) => pad.left + (i / (probs.length - 1 || 1)) * (W - pad.left - pad.right);
+    const toY = (v: number) => pad.top + (1 - (Math.min(Math.max(v, min), max) - min) / range) * (H - pad.top - pad.bottom);
 
-    // Line
-    ctx.beginPath(); ctx.strokeStyle = "#58a6ff"; ctx.lineWidth = 1.5;
-    ctx.moveTo(toX(0), toY(vals[0]));
-    vals.forEach((v, i) => { if (i > 0) ctx.lineTo(toX(i), toY(v)); });
-    ctx.stroke();
-
-    // Dots
-    vals.forEach((v, i) => {
-      ctx.beginPath(); ctx.arc(toX(i), toY(v), 2, 0, Math.PI * 2);
-      ctx.fillStyle = v >= 0.9 ? "#3fb950" : v >= 0.8 ? "#58a6ff" : "#d29922";
-      ctx.fill();
+    // Draw threshold lines
+    [0.80, 0.90].forEach(thresh => {
+      const y = toY(thresh);
+      ctx.setLineDash([4, 4]);
+      ctx.strokeStyle = thresh >= 0.90 ? "rgba(63,185,80,0.3)" : "rgba(88,166,255,0.3)";
+      ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(pad.left, y); ctx.lineTo(W - pad.right, y); ctx.stroke();
     });
+    ctx.setLineDash([]);
+
+    probs.forEach((p) => {
+      const color = p.prob >= 0.90 ? "#3fb950" : p.prob >= 0.80 ? "#58a6ff" : "#d29922";
+      const x = toX(probs.indexOf(p));
+      const y = toY(p.prob);
+      ctx.beginPath(); ctx.arc(x, y, 3.5, 0, Math.PI * 2);
+      ctx.fillStyle = color; ctx.fill();
+    });
+
+    if (probs.length > 1) {
+      ctx.beginPath(); ctx.strokeStyle = "rgba(88,166,255,0.4)"; ctx.lineWidth = 1.5;
+      probs.forEach((p, i) => { if (i === 0) ctx.moveTo(toX(i), toY(p.prob)); else ctx.lineTo(toX(i), toY(p.prob)); });
+      ctx.stroke();
+    }
   }, [probs]);
 
-  if (probs.length < 2) return <div style={{ color: "#484f58", fontSize: "0.8rem" }}>No signals yet</div>;
+  if (probs.length === 0)
+    return <div style={{ color: "#484f58", fontSize: "0.8rem", padding: "0.5rem 0" }}>No signals yet</div>;
 
-  return <canvas ref={canvasRef} style={{ width: "100%", height: 80, display: "block" }} />;
+  return <canvas ref={canvasRef} style={{ width: "100%", height: "90px", display: "block" }} />;
 }
 
-// ─── GRU cascade bars ─────────────────────────────────────────────────────────
+// ─── GRU Cascade bars ─────────────────────────────────────────────────────────
 
 function GRUCascade({ gru }: { gru: GRU }) {
-  const hasData = Object.values(gru).some((v) => v !== 0);
+  const hasData = Object.keys(gru).length > 0;
 
-  const level = (label: string, down: number, flat: number, up: number) => {
-    const total = down + flat + up || 1;
-    const d = (down / total) * 100, f = (flat / total) * 100, u = (up / total) * 100;
-    const conf = Math.max(d, f, u);
-    const dir = d >= f && d >= u ? "↓" : u >= f && u >= d ? "↑" : "→";
-    const dirColor = d >= f && d >= u ? "#f85149" : u >= f ? "#3fb950" : "#8b949e";
-    const glow = conf > 60;
+  const level = (label: string, down: number, flat: number, up: number, glow?: boolean) => {
+    const d = (down * 100).toFixed(1), f = (flat * 100).toFixed(1), u = (up * 100).toFixed(1);
     return (
-      <div style={{ marginBottom: 10 }}>
-        <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4, fontSize: "0.78rem" }}>
-          <span style={{ color: "#8b949e", width: 50, flexShrink: 0 }}>{label}</span>
-          <span style={{ color: dirColor, fontWeight: 700, fontSize: "0.9rem" }}>{dir}</span>
-          <span style={{ color: conf > 60 ? dirColor : "#8b949e", fontSize: "0.75rem" }}>{conf.toFixed(0)}%</span>
+      <div style={{ marginBottom: 8 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", fontSize: "0.68rem", color: "#8b949e", marginBottom: 3 }}>
+          <span style={{ fontFamily: "monospace" }}>{label}</span>
+          <span style={{ color: parseFloat(u) > parseFloat(d) ? "#3fb950" : parseFloat(d) > parseFloat(u) ? "#da3633" : "#d29922" }}>
+            ↑{u}% ↔{f}% ↓{d}%
+          </span>
         </div>
         <div style={{
           display: "flex", height: 22, borderRadius: 4, overflow: "hidden",
-          boxShadow: glow ? `0 0 12px ${d >= u ? "rgba(248,81,73,0.4)" : "rgba(63,185,80,0.4)"}` : "none",
+          boxShadow: glow ? `0 0 12px ${parseFloat(d) >= parseFloat(u) ? "rgba(248,81,73,0.4)" : "rgba(63,185,80,0.4)"}` : "none",
           transition: "box-shadow 0.4s",
         }}>
           <div style={{ width: `${d}%`, background: "#da3633", transition: "width 0.6s" }} title={`Down ${down.toFixed(3)}`} />
@@ -209,13 +219,8 @@ function GRUCascade({ gru }: { gru: GRU }) {
     );
   };
 
-  if (!hasData) {
-    return (
-      <div style={{ color: "#484f58", fontSize: "0.8rem", padding: "0.5rem 0" }}>
-        GRU probs appear after first signal with warm GRU (≥788 bars)
-      </div>
-    );
-  }
+  if (!hasData)
+    return <div style={{ color: "#484f58", fontSize: "0.8rem", padding: "0.5rem 0" }}>GRU probs appear after first signal with warm GRU (≥788 bars)</div>;
 
   return (
     <div>
@@ -279,6 +284,42 @@ function SkipDonut({ reasons }: { reasons: Record<string, number> }) {
   );
 }
 
+// ─── Side split bars ──────────────────────────────────────────────────────────
+
+function SideSplit({ by_side }: { by_side: VizState["by_side"] }) {
+  const { yes_wins, yes_losses, no_wins, no_losses, yes_pnl, no_pnl } = by_side;
+  const yes_total = yes_wins + yes_losses;
+  const no_total = no_wins + no_losses;
+  if (yes_total + no_total === 0) return <div style={{ color: "#484f58", fontSize: "0.8rem" }}>No data yet</div>;
+
+  const Row = ({ label, wins, losses, pnl, color }: { label: string; wins: number; losses: number; pnl: number; color: string }) => {
+    const total = wins + losses;
+    const wr = total > 0 ? ((wins / total) * 100).toFixed(0) : "–";
+    const pnlStr = (pnl > 0 ? "+" : "") + "$" + pnl.toFixed(2);
+    return (
+      <div style={{ marginBottom: 10 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", fontSize: "0.72rem", marginBottom: 4 }}>
+          <span style={{ color, fontWeight: 700 }}>{label}</span>
+          <span style={{ color: "#8b949e" }}>{wins}W / {losses}L · <span style={{ color: wr !== "–" && parseInt(wr) >= 60 ? "#3fb950" : "#d29922" }}>{wr}%</span> · <span style={{ color: pnl >= 0 ? "#3fb950" : "#f85149", fontWeight: 700 }}>{pnlStr}</span></span>
+        </div>
+        {total > 0 && (
+          <div style={{ display: "flex", height: 10, borderRadius: 4, overflow: "hidden", background: "#21262d" }}>
+            <div style={{ width: `${(wins / total) * 100}%`, background: "#238636", transition: "width 0.6s" }} />
+            <div style={{ width: `${(losses / total) * 100}%`, background: "#da3633", transition: "width 0.6s" }} />
+          </div>
+        )}
+      </div>
+    );
+  };
+
+  return (
+    <div>
+      <Row label="YES trades" wins={yes_wins} losses={yes_losses} pnl={yes_pnl} color="#3fb950" />
+      <Row label="NO  trades" wins={no_wins} losses={no_losses} pnl={no_pnl} color="#58a6ff" />
+    </div>
+  );
+}
+
 // ─── Recent events feed ───────────────────────────────────────────────────────
 
 function EventFeed({ events }: { events: TradeEvent[] }) {
@@ -292,7 +333,7 @@ function EventFeed({ events }: { events: TradeEvent[] }) {
     risk_halt: "#da3633", session_start: "#2ea043", session_end: "#484f58",
   };
   return (
-    <div style={{ display: "flex", flexDirection: "column", gap: 5, maxHeight: 240, overflowY: "auto" }}>
+    <div style={{ display: "flex", flexDirection: "column", gap: 5, maxHeight: 220, overflowY: "auto" }}>
       {events.length === 0 && <div style={{ color: "#484f58", fontSize: "0.8rem" }}>Waiting for bot activity…</div>}
       {events.map((ev) => {
         let pnlStr = "";
@@ -375,10 +416,11 @@ export default function VizPage({ session }: { session: SessionInfo }) {
   if (!state) return null;
 
   const upPnl = state.total_pnl >= 0;
+  const upToday = state.today_pnl >= 0;
   const winRateColor = state.win_rate == null ? "#8b949e" : state.win_rate >= 60 ? "#3fb950" : state.win_rate >= 45 ? "#d29922" : "#f85149";
   const balanceAge = state.balance_updated_at
-    ? `Updated ${state.balance_updated_at.replace("T", " ").slice(0, 16)} UTC`
-    : "Static (awaiting bot sync)";
+    ? `Synced ${state.balance_updated_at.replace("T", " ").slice(0, 16)} UTC`
+    : "Awaiting balance sync";
 
   return (
     <div>
@@ -396,18 +438,29 @@ export default function VizPage({ session }: { session: SessionInfo }) {
         </div>
       </div>
 
-      {/* ── Stat row ── */}
-      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(130px, 1fr))", gap: "0.75rem", marginBottom: "1rem" }}>
+      {/* ── Stat row 1: balance + performance ── */}
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(120px, 1fr))", gap: "0.75rem", marginBottom: "0.75rem" }}>
         <Stat label="Fund Balance" val={`$${state.balance.toFixed(2)}`} sub={balanceAge} color="#58a6ff" />
-        <Stat label="Cumul. P&L" val={(upPnl ? "+" : "") + `$${state.total_pnl.toFixed(2)}`} color={upPnl ? "#3fb950" : "#f85149"} />
+        <Stat label="Total P&L" val={(upPnl ? "+" : "") + `$${state.total_pnl.toFixed(2)}`} color={upPnl ? "#3fb950" : "#f85149"} />
         <Stat
           label="Win Rate"
           val={state.win_rate != null ? `${state.win_rate}%` : "–"}
           sub={`${state.wins}W / ${state.losses}L`}
           color={winRateColor}
         />
-        <Stat label="Fills" val={String(state.total_fills)} sub="all time" />
+        <Stat label="Today P&L" val={(upToday ? "+" : "") + `$${state.today_pnl.toFixed(2)}`}
+          sub={`${state.today_wins}W / ${state.today_losses}L today`}
+          color={upToday ? "#3fb950" : "#f85149"} />
+        <Stat label="Fills" val={String(state.total_fills)} sub={`${state.total_contracts} contracts`} />
         <Stat label="NAV / Unit" val={`$${state.nav.toFixed(4)}`} sub={`${state.total_units.toFixed(1)} units`} />
+      </div>
+
+      {/* ── Stat row 2: edge stats ── */}
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(120px, 1fr))", gap: "0.75rem", marginBottom: "1rem" }}>
+        {state.avg_win != null && <Stat label="Avg Win" val={`+$${state.avg_win.toFixed(2)}`} color="#3fb950" />}
+        {state.avg_loss != null && <Stat label="Avg Loss" val={`$${state.avg_loss.toFixed(2)}`} color="#f85149" />}
+        {state.best_trade !== 0 && <Stat label="Best Trade" val={`+$${state.best_trade.toFixed(2)}`} color="#3fb950" />}
+        {state.worst_trade !== 0 && <Stat label="Worst Trade" val={`$${state.worst_trade.toFixed(2)}`} color="#f85149" />}
         {state.last_model_prob != null && (
           <Stat
             label="Last Signal"
@@ -416,14 +469,21 @@ export default function VizPage({ session }: { session: SessionInfo }) {
             color={state.last_model_prob >= 0.9 ? "#3fb950" : "#d29922"}
           />
         )}
+        <Stat label="Signals" val={String(state.event_type_counts?.signal ?? 0)} sub={`${state.event_type_counts?.no_signal ?? 0} skipped`} />
       </div>
 
-      {/* ── Equity curve ── */}
-      <Section title="Fund Equity Curve — $PnL per trade (green=win, red=loss)">
-        <EquityChart points={state.equity_curve} />
-      </Section>
+      {/* ── Equity curve + P&L bars ── */}
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "1rem", marginBottom: "1rem" }}>
+        <Section title="Equity Curve — balance per fill">
+          <EquityChart points={state.equity_curve} />
+        </Section>
 
-      {/* ── Signal prob history + GRU cascade ── */}
+        <Section title={`Per-trade P&L — ${state.pnl_bars.length} fills (green=win, red=loss)`}>
+          <PnLBars bars={state.pnl_bars} />
+        </Section>
+      </div>
+
+      {/* ── Signal probs + GRU cascade ── */}
       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "1rem", marginBottom: "1rem" }}>
         <Section title={`Signal Probabilities — last ${state.recent_probs.length} signals`}>
           <ProbSparkline probs={state.recent_probs} />
@@ -442,20 +502,25 @@ export default function VizPage({ session }: { session: SessionInfo }) {
         </Section>
       </div>
 
-      {/* ── Skip reasons + Event feed ── */}
+      {/* ── Side split + Skip reasons ── */}
       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "1rem", marginBottom: "1rem" }}>
+        <Section title="YES vs NO Split — win rates by side">
+          <SideSplit by_side={state.by_side} />
+        </Section>
+
         <Section title="Skip Reasons — why bot didn't trade">
           <SkipDonut reasons={state.skip_reasons} />
         </Section>
-
-        <Section title="Recent Activity">
-          <EventFeed events={state.recent_events} />
-        </Section>
       </div>
+
+      {/* ── Activity feed ── */}
+      <Section title="Recent Activity">
+        <EventFeed events={state.recent_events} />
+      </Section>
 
       {/* ── Footer ── */}
       <div style={{ color: "#484f58", fontSize: "0.7rem", textAlign: "right" }}>
-        Auto-refreshes every 15s · {session?.display_name} · eom_v10c
+        Auto-refreshes every 15s · {session?.display_name} · eom_v10c · max 3 contracts
       </div>
     </div>
   );
