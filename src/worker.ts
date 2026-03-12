@@ -775,20 +775,26 @@ app.get("/api/viz/state", async (c) => {
     } catch { /* skip */ }
   }
 
-  // ── Last signal for GRU probs ──
+  // ── Last signal for GRU probs + SHAP ──
   const lastSignal = await db
-    .prepare("SELECT payload FROM kf_trade_events WHERE event_type = 'signal' ORDER BY id DESC LIMIT 1")
-    .first<{ payload: string }>();
+    .prepare("SELECT payload, created_at FROM kf_trade_events WHERE event_type = 'signal' ORDER BY id DESC LIMIT 1")
+    .first<{ payload: string; created_at: string }>();
   let gru: Record<string, number> = {};
   let last_model_prob: number | null = null;
   let last_signal_ts: string | null = null;
   let last_signal_side: string | null = null;
+  let last_signal_shap: { f: string; v: number }[] = [];
+  let last_feat_snapshot: Record<string, number> = {};
+  let last_elapsed_frac: number | null = null;
+  let last_regime_score: number | null = null;
   if (lastSignal) {
     try {
       const p = JSON.parse(lastSignal.payload) as any;
       last_model_prob = p.model_prob ?? null;
       last_signal_side = p.side ?? null;
-      last_signal_ts = p.timestamp ?? null;
+      last_signal_ts = p.timestamp ?? lastSignal.created_at ?? null;
+      last_elapsed_frac = p.elapsed_frac ?? null;
+      last_regime_score = p.regime_score ?? null;
       if (p.gru_p_down_30s !== undefined) {
         gru = {
           l1_down: p.gru_p_down_30s, l1_flat: p.gru_p_flat_30s, l1_up: p.gru_p_up_30s,
@@ -796,6 +802,8 @@ app.get("/api/viz/state", async (c) => {
           l3_down: p.gru_p_down_300s, l3_flat: p.gru_p_flat_300s, l3_up: p.gru_p_up_300s,
         };
       }
+      if (Array.isArray(p.shap)) last_signal_shap = p.shap;
+      if (p.feat_snapshot && typeof p.feat_snapshot === "object") last_feat_snapshot = p.feat_snapshot;
     } catch { /* ignore */ }
   }
 
@@ -852,6 +860,10 @@ app.get("/api/viz/state", async (c) => {
     last_model_prob,
     last_signal_ts,
     last_signal_side,
+    last_elapsed_frac,
+    last_regime_score,
+    last_signal_shap,
+    last_feat_snapshot,
     recent_probs,
     skip_reasons,
   });
