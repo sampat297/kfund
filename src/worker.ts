@@ -680,6 +680,33 @@ app.post("/api/admin/init-db", async (c) => {
   return c.json({ ok: true, message: "DB initialized" });
 });
 
+// ─── Admin: reset event history, keep last N fills ────────────────────────────
+
+app.post("/api/admin/reset-history", async (c) => {
+  const session = await getSession(c);
+  if (!session?.is_admin) return c.json({ error: "Admin required" }, 403);
+
+  const body = await c.req.json<{ keep_fills?: number }>().catch(() => ({} as { keep_fills?: number }));
+  const keep_fills = body.keep_fills ?? 5;
+  const db = c.env.DB;
+
+  // Keep the last N fill events, delete everything else
+  await db.batch([
+    db.prepare(
+      `DELETE FROM kf_trade_events WHERE event_type = 'fill' AND id NOT IN (
+         SELECT id FROM kf_trade_events WHERE event_type = 'fill' ORDER BY id DESC LIMIT ?
+       )`
+    ).bind(keep_fills),
+    db.prepare(`DELETE FROM kf_trade_events WHERE event_type != 'fill'`),
+  ]);
+
+  const { results } = await db.prepare(
+    `SELECT COUNT(*) as cnt FROM kf_trade_events`
+  ).all<{ cnt: number }>();
+
+  return c.json({ ok: true, remaining_rows: results[0]?.cnt ?? 0 });
+});
+
 // ─── Bot event push ───────────────────────────────────────────────────────────
 
 app.post("/api/events/push", async (c) => {
